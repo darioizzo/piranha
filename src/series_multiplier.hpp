@@ -22,6 +22,7 @@
 #define PIRANHA_SERIES_MULTIPLIER_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <boost/any.hpp>
 #include <cmath>
 #include <cstddef>
@@ -29,6 +30,7 @@
 #include <iterator>
 #include <limits>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <new> // For bad_alloc.
 #include <numeric>
@@ -45,6 +47,7 @@
 #include "detail/series_multiplier_fwd.hpp"
 #include "exceptions.hpp"
 #include "key_is_multipliable.hpp"
+#include "memory.hpp"
 #include "mp_integer.hpp"
 #include "runtime_info.hpp"
 #include "safe_cast.hpp"
@@ -146,7 +149,7 @@ class series_multiplier
 		template <typename T = Series, call_enabler<T> = 0>
 		Series operator()() const
 		{
-			return execute<default_functor>();
+			return execute2<default_functor>();
 		}
 	protected:
 		/// Low-level implementation of series multiplication.
@@ -282,6 +285,158 @@ class series_multiplier
 				}
 				// Clean up the temporary series.
 				cleanup();
+				return retval;
+			}
+		}
+		struct atomic_flag_array
+		{
+			using value_type = std::atomic_flag;
+			explicit atomic_flag_array(const std::size_t &size):m_ptr(nullptr),m_size(size)
+			{
+				if (unlikely(size > std::numeric_limits<std::size_t>::max() / sizeof(value_type))) {
+					piranha_throw(std::bad_alloc,);
+				}
+				m_ptr = static_cast<value_type *>(aligned_palloc(0u,size * sizeof(value_type)));
+				for (std::size_t i = 0u; i < m_size; ++i) {
+					::new (static_cast<void *>(m_ptr + i)) value_type(ATOMIC_FLAG_INIT);
+				}
+			}
+			~atomic_flag_array()
+			{
+				for (std::size_t i = 0u; i < m_size; ++i) {
+					(m_ptr + i)->~value_type();
+				}
+				aligned_pfree(0u,static_cast<void *>(m_ptr));
+			}
+			value_type &operator[](const std::size_t &i)
+			{
+				return *(m_ptr + i);
+			}
+			const value_type &operator[](const std::size_t &i) const
+			{
+				return *(m_ptr + i);
+			}
+			value_type		*m_ptr;
+			const std::size_t	m_size;
+		};
+		struct atomic_lock_guard
+		{
+			explicit atomic_lock_guard(std::atomic_flag &af):m_af(af)
+			{
+				while (m_af.test_and_set(std::memory_order_acquire)) {}
+			}
+			~atomic_lock_guard()
+			{
+				m_af.clear(std::memory_order_release);
+			}
+			std::atomic_flag &m_af;
+		};
+		template <typename Functor>
+		Series execute2() const
+		{
+			// Do not do anything if one of the two series is empty.
+			if (unlikely(m_s1->empty() || m_s2->empty())) {
+				// NOTE: requirement is ok, a series must be def-ctible.
+				return Series{};
+			}
+			// This is the size type that will be used throughout the calculations.
+			using size_type = decltype(m_v1.size());
+			const size_type size1 = m_v1.size(), size2 = m_v2.size();
+			piranha_assert(size1 && size2);
+			// Establish the number of threads to use.
+			size_type n_threads = safe_cast<size_type>(thread_pool::use_threads(
+				integer(size1) * size2,integer(settings::get_min_work_per_thread())
+			));
+			piranha_assert(n_threads);
+			// An additional check on n_threads is that its size is not greater than the size of the first series,
+			// as we are using the first operand to split up the work.
+			if (n_threads > size1) {
+				n_threads = size1;
+			}
+			if (likely(n_threads == 1u)) {
+				Series retval;
+				retval.m_symbol_set = m_s1->m_symbol_set;
+				Functor f(&m_v1[0u],size1,&m_v2[0u],size2,retval);
+				const auto tmp = rehasher(f);
+				blocked_multiplication(f);
+				if (tmp.first) {
+					trace_estimates(retval.size(),tmp.second);
+				}
+				return retval;
+			} else {
+				// Init the return series.
+				Series retval;
+				retval.m_symbol_set = m_s1->m_symbol_set;
+				// Estimate the final size and rehash accordingly.
+				{
+				Functor f(&m_v1[0u],size1,&m_v2[0u],size2,retval);
+				// NOTE: this method will either clear up retval on exit, or throw. In any case we don't need
+				// to care about retval containing elements.
+				auto size = estimate_final_series_size(f);
+				piranha_assert(retval.size() == 0u);
+				retval.m_container.rehash(safe_cast<decltype(size)>(std::ceil(static_cast<double>(size) / retval.m_container.max_load_factor())));
+				}
+				// Init the vector of spinlocks.
+				atomic_flag_array sl_array(safe_cast<std::size_t>(retval.m_container.bucket_count()));
+				// Init the future list.
+				future_list<std::future<void>> f_list;
+				// Block size.
+				const auto block_size = size1 / n_threads;
+				// TODO doc.
+				using bucket_size_type = decltype(retval.m_container.bucket_count());
+				std::mutex ins_mutex;
+				integer tot_ins(0);
+				try {
+					for (size_type i = 0u; i < n_threads; ++i) {
+						// The thread functor.
+						auto f = [i,this,block_size,n_threads,&sl_array,&retval,&ins_mutex,&tot_ins]() {
+							// TODO overflow protection.
+							bucket_size_type insertion_count = 0u;
+							// Key type.
+							using key_type = typename Series::term_type::key_type;
+							// The type used to store the result of each term-by-term multiplication.
+							constexpr std::size_t arity = key_type::multiply_arity;
+							using mult_res_type = std::array<typename Series::term_type,arity>;
+							mult_res_type tmp;
+							// End of retval container (thread-safe).
+							const auto c_end = retval.m_container.end();
+							const auto e1 = (i == n_threads - 1u) ? (&(this->m_v1[0u]) + this->m_v1.size()) :
+								(&(this->m_v1[0u]) + (i + 1u) * block_size);
+							const auto e2 = &(this->m_v2[0u]) + this->m_v2.size();
+							for (auto s1 = &(this->m_v1[0u]) + i * block_size; s1 != e1; ++s1) {
+								for (auto s2 = &(this->m_v2[0u]); s2 != e2; ++s2) {
+									// Perform the multiplication.
+									key_type::multiply(tmp,**s1,**s2,retval.m_symbol_set);
+									// Insertion.
+									for (std::size_t j = 0u; j < arity; ++j) {
+										auto &t = tmp[j];
+										// Try to locate the term into retval.
+										auto bucket_idx = retval.m_container._bucket(t);
+										// Lock the bucket.
+										atomic_lock_guard alg(sl_array[static_cast<std::size_t>(bucket_idx)]);
+										const auto it = retval.m_container._find(t,bucket_idx);
+										if (it == c_end) {
+											retval.m_container._unique_insert(std::move(t),bucket_idx);
+											++insertion_count;
+										} else {
+											it->m_cf += std::move(t.m_cf);
+										}
+									}
+								}
+							}
+							// Final update of insertion count.
+							std::lock_guard<std::mutex> lock(ins_mutex);
+							tot_ins += insertion_count;
+						};
+						f_list.push_back(thread_pool::enqueue(static_cast<unsigned>(i),f));
+					}
+					f_list.wait_all();
+					f_list.get_all();
+				} catch (...) {
+					f_list.wait_all();
+					throw;
+				}
+				retval.m_container._update_size(static_cast<bucket_size_type>(tot_ins));
 				return retval;
 			}
 		}
