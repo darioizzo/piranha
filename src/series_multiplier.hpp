@@ -293,6 +293,9 @@ class series_multiplier
 		 */
 		class default_functor
 		{
+				// NOTE: this should not create problems if the key_type has no multiply_arity, as series_multiplier
+				// is a template and thus its members are instantiated only as needed. In the series_has_multiplier checks,
+				// we never need to access this typedef.
 				using mult_res_type = std::array<typename Series::term_type,Series::term_type::key_type::multiply_arity>;
 			public:
 				/// Alias for the term type of \p Series.
