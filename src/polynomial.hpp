@@ -1066,15 +1066,138 @@ class series_multiplier<Series,detail::poly_multiplier_enabler<Series>>:
 			// Partial degree truncation.
 			return partial_truncated_multiplication(std::get<1u>(t),std::get<2u>(t));
 		}
+		// Detect if we can enable the optimisation with fast degree computation. We require
+		// the term to have the degree only in the key and the degree type to be an integer.
+		template <typename Term>
+		struct term_has_fast_degree
+		{
+			// NOTE: here we know that:
+			// - we can call ps_get_degree(), as this is only used when we know truncation is possible,
+			// - we call the total form of ps_get_degree(), but we know that the partial form is supported
+			//   too and that they yield the same type.
+			static const bool value = !has_degree<typename Term::cf_type>::value &&
+				detail::is_mp_integer<decltype(detail::ps_get_degree(std::declval<const Term &>(),
+				std::declval<const symbol_set &>()))>::value;
+
+		};
+		template <typename Term, typename ... Args, typename std::enable_if<term_has_fast_degree<Term>::value,int>::type = 0>
+		static long get_term_degree(const Term &t, Args && ... args)
+		{
+			return static_cast<long>(detail::ps_get_degree(t,std::forward<Args>(args)...));
+		}
+		template <typename Term, typename ... Args, typename std::enable_if<!term_has_fast_degree<Term>::value,int>::type = 0>
+		static auto get_term_degree(const Term &t, Args && ... args) -> decltype(detail::ps_get_degree(t,std::forward<Args>(args)...))
+		{
+			return detail::ps_get_degree(t,std::forward<Args>(args)...);
+		}
+		template <typename Term, typename T, typename std::enable_if<!term_has_fast_degree<Term>::value,int>::type = 0>
+		static const T &convert_max_degree(const T &max_degree)
+		{
+			return max_degree;
+		}
+		template <typename Term, typename T, typename std::enable_if<term_has_fast_degree<Term>::value,int>::type = 0>
+		static long convert_max_degree(const T &max_degree)
+		{
+			return static_cast<long>(max_degree);
+		}
+		template <typename T, typename U, typename Functor>
+		static void parallel_transform(const std::vector<T> &c1, std::vector<U> &c2, Functor f)
+		{
+//			unsigned n_threads = safe_cast<unsigned>(thread_pool::use_threads(
+//				integer(c1.size()),integer(settings::get_min_work_per_thread())
+//			));
+			auto n_threads = 4u;
+			if (n_threads == 1u) {
+				std::transform(c1.begin(),c1.end(),c2.begin(),f);
+				return;
+			}
+			const auto block_size = c1.size() / n_threads;
+			auto local_transform = [&f](const T *b, const T *e, U *o) {
+				std::transform(b,e,o,f);
+			};
+			future_list<decltype(thread_pool::enqueue(0u,local_transform,c1.data(),c1.data(),c2.data()))> ff_list;
+			try {
+				for (unsigned i = 0u; i < n_threads; ++i) {
+					auto b = c1.data() + i * block_size;
+					auto e = (i == n_threads - 1u) ? (c1.data() + c1.size()) :
+						(c1.data() + (i + 1u) * block_size);
+					auto o = c2.data() + i * block_size;
+					ff_list.push_back(thread_pool::enqueue(i,local_transform,b,e,o));
+				}
+				// First let's wait for everything to finish.
+				ff_list.wait_all();
+				// Then, let's handle the exceptions.
+				ff_list.get_all();
+			} catch (...) {
+				ff_list.wait_all();
+				throw;
+			}
+		}
 		// NOTE: total and partial can be compressed in a single function with variadic arguments.
 		// Unfortunately, GCC 4.8 does not support capturing variadic args in lambdas so we have to hold this off
 		// for the moment. Consider maybe using std::bind as a replacement.
 		template <typename T>
-		Series total_truncated_multiplication(const T &max_degree) const
+		Series total_truncated_multiplication(const T &max_d) const
 		{
+boost::timer::auto_cpu_timer t;
 			using term_type = typename Series::term_type;
-			using degree_type = decltype(detail::ps_get_degree(term_type{},this->m_ss));
+			using degree_type = decltype(get_term_degree(term_type{},this->m_ss));
 			using size_type = typename base::size_type;
+			// NOTE: if this is a long, then we are getting a const reference to a temporary. The lifetime
+			// of the temporary will be extended to the lifetime of the reference.
+			const degree_type &max_degree = convert_max_degree<term_type>(max_d);
+			// First let's create two vectors with the degrees of the terms in the two series. In the second series,
+			// we negate and add the max degree in order to avoid adding in the skipping functor.
+			// TODO checks
+			std::vector<degree_type> v_d1(this->m_v1.size()), v_d2(this->m_v2.size());
+			using d_size_type = typename std::vector<degree_type>::size_type;
+{
+boost::timer::auto_cpu_timer t;
+			parallel_transform(this->m_v1,v_d1,[this](term_type const *p) {
+				return get_term_degree(*p,this->m_ss);
+			});
+			parallel_transform(this->m_v2,v_d2,[this,&max_degree](term_type const *p) {
+				// TODO: safe sub.
+				return max_degree - get_term_degree(*p,this->m_ss);
+			});
+std::cout << "transform timing: ";
+}
+			// Next we need to order the terms in the second series, and also the corresponding degree vector.
+			// First we create a vector of indices and we fill it.
+			std::vector<size_type> idx_vector(safe_cast<typename std::vector<size_type>::size_type>(this->m_v2.size()));
+			std::iota(idx_vector.begin(),idx_vector.end(),size_type(0u));
+			// Second, we sort the vector of indices according to the degrees in the second series.
+{
+boost::timer::auto_cpu_timer t;
+			std::sort(idx_vector.begin(),idx_vector.end(),[&v_d2](const size_type &i1, const size_type &i2) {
+				return v_d2[static_cast<d_size_type>(i1)] > v_d2[static_cast<d_size_type>(i2)];
+			});
+std::cout << "sort timing: ";
+}
+			// Finally, we apply the permutation to v_d2 and m_v2.
+			decltype(this->m_v2) v2_copy(this->m_v2.size());
+			decltype(v_d2) v_d2_copy(v_d2.size());
+			std::transform(idx_vector.begin(),idx_vector.end(),v2_copy.begin(),[this](const size_type &i) {
+				return this->m_v2[i];
+			});
+			std::transform(idx_vector.begin(),idx_vector.end(),v_d2_copy.begin(),[&v_d2](const size_type &i) {
+				return v_d2[static_cast<d_size_type>(i)];
+			});
+			this->m_v2 = std::move(v2_copy);
+			v_d2 = std::move(v_d2_copy);
+			// The skipping functor.
+			auto sf = [&v_d1,&v_d2](const size_type &i, const size_type &j) {
+				return v_d1[static_cast<d_size_type>(i)] > v_d2[static_cast<d_size_type>(j)];
+			};
+			// The filter functor: will return 1 if the degree of the term resulting from the multiplication of i and j
+			// is greater than the max degree, zero otherwise.
+			auto ff = [&sf](const size_type &i, const size_type &j) {
+				return static_cast<unsigned>(sf(i,j));
+			};
+			auto retval = this->plain_multiplication(sf,ff);
+std::cout << "tot mult timing: ";
+			return retval;
+#if 0
 			// First let's order the terms in the second series according to the degree.
 			std::stable_sort(this->m_v2.begin(),this->m_v2.end(),[this](term_type const *p1, term_type const *p2) {
 				return detail::ps_get_degree(*p1,this->m_ss) < detail::ps_get_degree(*p2,this->m_ss);
@@ -1099,6 +1222,7 @@ class series_multiplier<Series,detail::poly_multiplier_enabler<Series>>:
 				return static_cast<unsigned>(sf(i,j));
 			};
 			return this->plain_multiplication(sf,ff);
+#endif
 		}
 		template <typename T>
 		Series partial_truncated_multiplication(const T &max_degree, const std::vector<std::string> &names) const
